@@ -1,12 +1,24 @@
-// Copyright 2020 Mobvoi Inc. All Rights Reserved.
-// Author: binbinzhang@mobvoi.com (Binbin Zhang)
-//         di.wu@mobvoi.com (Di Wu)
+// Copyright (c) 2020 Mobvoi Inc (Binbin Zhang, Di Wu)
+//               2022 Binbin Zhang (binbzha@qq.com)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #ifndef DECODER_ASR_DECODER_H_
 #define DECODER_ASR_DECODER_H_
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -60,6 +72,7 @@ struct WordPiece {
 struct DecodeResult {
   float score = -kFloatMax;
   std::string sentence;
+  std::unordered_set<std::string> contexts;
   std::vector<WordPiece> word_pieces;
 
   static bool CompareFunc(const DecodeResult& a, const DecodeResult& b) {
@@ -79,7 +92,7 @@ enum DecodeState {
 struct DecodeResource {
   std::shared_ptr<AsrModel> model = nullptr;
   std::shared_ptr<fst::SymbolTable> symbol_table = nullptr;
-  std::shared_ptr<fst::Fst<fst::StdArc>> fst = nullptr;
+  std::shared_ptr<fst::VectorFst<fst::StdArc>> fst = nullptr;
   std::shared_ptr<fst::SymbolTable> unit_table = nullptr;
   std::shared_ptr<ContextGraph> context_graph = nullptr;
   std::shared_ptr<PostProcessor> post_processor = nullptr;
@@ -125,8 +138,9 @@ class AsrDecoder {
   std::shared_ptr<FeaturePipeline> feature_pipeline_;
   std::shared_ptr<AsrModel> model_;
   std::shared_ptr<PostProcessor> post_processor_;
+  std::shared_ptr<ContextGraph> context_graph_;
 
-  std::shared_ptr<fst::Fst<fst::StdArc>> fst_ = nullptr;
+  std::shared_ptr<fst::VectorFst<fst::StdArc>> fst_ = nullptr;
   // output symbol table
   std::shared_ptr<fst::SymbolTable> symbol_table_;
   // e2e unit symbol table

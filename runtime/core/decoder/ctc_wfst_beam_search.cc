@@ -1,5 +1,16 @@
-// Copyright 2021 Mobvoi Inc. All Rights Reserved.
-// Author: binbinzhang@mobvoi.com (Binbin Zhang)
+// Copyright (c) 2021 Mobvoi Inc (Binbin Zhang)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "decoder/ctc_wfst_beam_search.h"
 
@@ -66,8 +77,8 @@ void CtcWfstBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
   }
   // Every time we get the log posterior, we decode it all before return
   for (int i = 0; i < logp.size(); i++) {
-    float blank_score = std::exp(logp[i][0]);
-    if (blank_score > opts_.blank_skip_thresh) {
+    float blank_score = std::exp(logp[i][opts_.blank]);
+    if (blank_score > opts_.blank_skip_thresh * opts_.blank_scale) {
       VLOG(3) << "skipping frame " << num_frames_ << " score " << blank_score;
       is_last_frame_blank_ = true;
       last_frame_prob_ = logp[i];
@@ -77,7 +88,8 @@ void CtcWfstBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
           std::max_element(logp[i].begin(), logp[i].end()) - logp[i].begin();
       // Optional, adding one blank frame if we has skipped it in two same
       // symbols
-      if (cur_best != 0 && is_last_frame_blank_ && cur_best == last_best_) {
+      if (cur_best != opts_.blank && is_last_frame_blank_ &&
+          cur_best == last_best_) {
         decodable_.AcceptLoglikes(last_frame_prob_);
         decoder_.AdvanceDecoding(&decodable_, 1);
         decoded_frames_mapping_.push_back(num_frames_ - 1);
@@ -101,12 +113,11 @@ void CtcWfstBeamSearch::Search(const std::vector<std::vector<float>>& logp) {
     outputs_.resize(1);
     likelihood_.resize(1);
     kaldi::Lattice lat;
-    decoder_.GetBestPath(&lat, false);
+    decoder_.GetBestPath(&lat, true);
     std::vector<int> alignment;
     kaldi::LatticeWeight weight;
     fst::GetLinearSymbolSequence(lat, &alignment, &outputs_[0], &weight);
     ConvertToInputs(alignment, &inputs_[0]);
-    RemoveContinuousTags(&outputs_[0]);
     VLOG(3) << weight.Value1() << " " << weight.Value2();
     likelihood_[0] = -(weight.Value1() + weight.Value2());
   }
@@ -146,7 +157,6 @@ void CtcWfstBeamSearch::FinalizeSearch() {
       fst::GetLinearSymbolSequence(nbest_lats[i], &alignment, &outputs_[i],
                                    &weight);
       ConvertToInputs(alignment, &inputs_[i], &times_[i]);
-      RemoveContinuousTags(&outputs_[i]);
       likelihood_[i] = -(weight.Value1() + weight.Value2());
     }
   }
@@ -159,28 +169,13 @@ void CtcWfstBeamSearch::ConvertToInputs(const std::vector<int>& alignment,
   if (time != nullptr) time->clear();
   for (int cur = 0; cur < alignment.size(); ++cur) {
     // ignore blank
-    if (alignment[cur] - 1 == 0) continue;
+    if (alignment[cur] - 1 == opts_.blank) continue;
     // merge continuous same label
     if (cur > 0 && alignment[cur] == alignment[cur - 1]) continue;
 
     input->push_back(alignment[cur] - 1);
     if (time != nullptr) {
       time->push_back(decoded_frames_mapping_[cur]);
-    }
-  }
-}
-
-void CtcWfstBeamSearch::RemoveContinuousTags(std::vector<int>* output) {
-  if (context_graph_) {
-    for (auto it = output->begin(); it != output->end();) {
-      if (*it == context_graph_->start_tag_id() ||
-          *it == context_graph_->end_tag_id()) {
-        if (it + 1 != output->end() && *it == *(it + 1)) {
-          it = output->erase(it);
-          continue;
-        }
-      }
-      ++it;
     }
   }
 }

@@ -1,33 +1,46 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Copyright 2021 Mobvoi Inc. All Rights Reserved.
-# Author: di.wu@mobvoi.com (DI WU)
+# Copyright (c) 2020 Mobvoi Inc. (authors: Binbin Zhang, Di Wu)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Modified from ESPnet(https://github.com/espnet/espnet)
 """ConvolutionModule definition."""
 
 from typing import Tuple
 
 import torch
 from torch import nn
-from typeguard import check_argument_types
+
+from wenet.utils.class_utils import WENET_NORM_CLASSES
 
 
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Conformer model."""
-    def __init__(self,
-                 channels: int,
-                 kernel_size: int = 15,
-                 activation: nn.Module = nn.ReLU(),
-                 norm: str = "batch_norm",
-                 causal: bool = False,
-                 bias: bool = True):
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 15,
+        activation: nn.Module = nn.ReLU(),
+        norm: str = "batch_norm",
+        causal: bool = False,
+        bias: bool = True,
+        norm_eps: float = 1e-5,
+    ):
         """Construct an ConvolutionModule object.
         Args:
             channels (int): The number of channels of conv layers.
             kernel_size (int): Kernel size of conv layers.
             causal (int): Whether use causal convolution or not
         """
-        assert check_argument_types()
         super().__init__()
 
         self.pointwise_conv1 = nn.Conv1d(
@@ -60,13 +73,14 @@ class ConvolutionModule(nn.Module):
             bias=bias,
         )
 
-        assert norm in ['batch_norm', 'layer_norm']
+        assert norm in ['batch_norm', 'layer_norm', 'rms_norm']
         if norm == "batch_norm":
             self.use_layer_norm = False
-            self.norm = nn.BatchNorm1d(channels)
+            self.norm = WENET_NORM_CLASSES['batch_norm'](channels,
+                                                         eps=norm_eps)
         else:
             self.use_layer_norm = True
-            self.norm = nn.LayerNorm(channels)
+            self.norm = WENET_NORM_CLASSES[norm](channels, eps=norm_eps)
 
         self.pointwise_conv2 = nn.Conv1d(
             channels,
@@ -112,7 +126,7 @@ class ConvolutionModule(nn.Module):
             assert (x.size(2) > self.lorder)
             new_cache = x[:, :, -self.lorder:]
         else:
-            # It's better we just return None if no cache is requried,
+            # It's better we just return None if no cache is required,
             # However, for JIT export, here we just fake one tensor instead of
             # None.
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)

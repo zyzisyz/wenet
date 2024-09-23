@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright (c) 2022, Xingchen Song (sxc19@mails.tsinghua.edu.cn)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,7 @@
 from __future__ import print_function
 
 import argparse
+import logging
 import os
 import copy
 import sys
@@ -24,12 +24,12 @@ import torch
 import yaml
 import numpy as np
 
-from wenet.transformer.asr_model import init_asr_model
-from wenet.utils.checkpoint import load_checkpoint
+from wenet.utils.init_model import init_model
 
 try:
     import onnx
     import onnxruntime
+    from onnxruntime.quantization import quantize_dynamic, QuantType
 except ImportError:
     print('Please install onnx and onnxruntime!')
     sys.exit(1)
@@ -40,12 +40,18 @@ def get_args():
     parser.add_argument('--config', required=True, help='config file')
     parser.add_argument('--checkpoint', required=True, help='checkpoint model')
     parser.add_argument('--output_dir', required=True, help='output directory')
-    parser.add_argument('--chunk_size', required=True,
-                        type=int, help='decoding chunk size')
-    parser.add_argument('--num_decoding_left_chunks', required=True,
-                        type=int, help='cache chunks')
-    parser.add_argument('--reverse_weight', default=0.5,
-                        type=float, help='reverse_weight in attention_rescoing')
+    parser.add_argument('--chunk_size',
+                        required=True,
+                        type=int,
+                        help='decoding chunk size')
+    parser.add_argument('--num_decoding_left_chunks',
+                        required=True,
+                        type=int,
+                        help='cache chunks')
+    parser.add_argument('--reverse_weight',
+                        default=0.5,
+                        type=float,
+                        help='reverse_weight in attention_rescoing')
     args = parser.parse_args()
     return args
 
@@ -92,6 +98,12 @@ def export_encoder(asr_model, args):
     #   3. 16/0  mode: next_cache_start == chunk_size for all chunks
     #   4. -1/-1 mode: next_cache_start == 0 for all chunks
     #   NO MORE DYNAMIC CHANGES!!
+    #
+    # NOTE(Mddct): We retain the current design for the convenience of supporting some
+    #   inference frameworks without dynamic shapes. If you're interested in all-in-one
+    #   model that supports different chunks please see:
+    #   https://github.com/wenet-e2e/wenet/pull/1174
+
     if args['left_chunks'] > 0:  # 16/4
         required_cache_size = args['chunk_size'] * args['left_chunks']
         offset = required_cache_size
@@ -107,16 +119,15 @@ def export_encoder(asr_model, args):
     elif args['left_chunks'] <= 0:  # 16/-1, -1/-1, 16/0
         required_cache_size = -1 if args['left_chunks'] < 0 else 0
         # Fake cache
-        att_cache = torch.zeros(
-            (args['num_blocks'], args['head'], 0,
-             args['output_size'] // args['head'] * 2))
+        att_cache = torch.zeros((args['num_blocks'], args['head'], 0,
+                                 args['output_size'] // args['head'] * 2))
         # Fake mask
         att_mask = torch.ones((0, 0, 0), dtype=torch.bool)
     cnn_cache = torch.zeros(
-        (args['num_blocks'], args['batch'],
-         args['output_size'], args['cnn_module_kernel'] - 1))
-    inputs = (chunk, offset, required_cache_size,
-              att_cache, cnn_cache, att_mask)
+        (args['num_blocks'], args['batch'], args['output_size'],
+         args['cnn_module_kernel'] - 1))
+    inputs = (chunk, offset, required_cache_size, att_cache, cnn_cache,
+              att_mask)
     print("\t\tchunk.size(): {}\n".format(chunk.size()),
           "\t\toffset: {}\n".format(offset),
           "\t\trequired_cache: {}\n".format(required_cache_size),
@@ -126,11 +137,21 @@ def export_encoder(asr_model, args):
 
     print("\tStage-1.2: torch.onnx.export")
     dynamic_axes = {
-        'chunk': {1: 'T'},
-        'att_cache': {2: 'T_CACHE'},
-        'att_mask': {2: 'T_ADD_T_CACHE'},
-        'output': {1: 'T'},
-        'r_att_cache': {2: 'T_CACHE'},
+        'chunk': {
+            1: 'T'
+        },
+        'att_cache': {
+            2: 'T_CACHE'
+        },
+        'att_mask': {
+            2: 'T_ADD_T_CACHE'
+        },
+        'output': {
+            1: 'T'
+        },
+        'r_att_cache': {
+            2: 'T_CACHE'
+        },
     }
     # NOTE(xcsong): We keep dynamic axes even if in 16/4 mode, this is
     #   to avoid padding the last chunk (which usually contains less
@@ -145,15 +166,19 @@ def export_encoder(asr_model, args):
     #     #   be changed.
     #     dynamic_axes.pop('att_cache')
     #     dynamic_axes.pop('r_att_cache')
-    torch.onnx.export(
-        encoder, inputs, encoder_outpath, opset_version=13,
-        export_params=True, do_constant_folding=True,
-        input_names=[
-            'chunk', 'offset', 'required_cache_size',
-            'att_cache', 'cnn_cache', 'att_mask'
-        ],
-        output_names=['output', 'r_att_cache', 'r_cnn_cache'],
-        dynamic_axes=dynamic_axes, verbose=False)
+    torch.onnx.export(encoder,
+                      inputs,
+                      encoder_outpath,
+                      opset_version=13,
+                      export_params=True,
+                      do_constant_folding=True,
+                      input_names=[
+                          'chunk', 'offset', 'required_cache_size',
+                          'att_cache', 'cnn_cache', 'att_mask'
+                      ],
+                      output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+                      dynamic_axes=dynamic_axes,
+                      verbose=False)
     onnx_encoder = onnx.load(encoder_outpath)
     for (k, v) in args.items():
         meta = onnx_encoder.metadata_props.add()
@@ -164,6 +189,10 @@ def export_encoder(asr_model, args):
     #   the file and resave it.
     onnx.save(onnx_encoder, encoder_outpath)
     print_input_output_info(onnx_encoder, "onnx_encoder")
+    # Dynamic quantization
+    model_fp32 = encoder_outpath
+    model_quant = os.path.join(args['output_dir'], 'encoder.quant.onnx')
+    quantize_dynamic(model_fp32, model_quant, weight_type=QuantType.QUInt8)
     print('\t\tExport onnx_encoder, done! see {}'.format(encoder_outpath))
 
     print("\tStage-1.3: check onnx_encoder and torch_encoder")
@@ -178,8 +207,8 @@ def export_encoder(asr_model, args):
         print("\t\ttorch chunk-{}: {}, offset: {}, att_cache: {},"
               " cnn_cache: {}, att_mask: {}".format(
                   i, list(torch_chunk.size()), torch_offset,
-                  list(torch_att_cache.size()),
-                  list(torch_cnn_cache.size()), list(torch_att_mask.size())))
+                  list(torch_att_cache.size()), list(torch_cnn_cache.size()),
+                  list(torch_att_mask.size())))
         # NOTE(xsong): att_mask of the first few batches need changes if
         #   we use 16/4 mode.
         if args['left_chunks'] > 0:  # 16/4
@@ -198,21 +227,26 @@ def export_encoder(asr_model, args):
     onnx_att_cache = to_numpy(att_cache)
     onnx_cnn_cache = to_numpy(cnn_cache)
     onnx_att_mask = to_numpy(att_mask)
-    ort_session = onnxruntime.InferenceSession(encoder_outpath)
+    ort_session = onnxruntime.InferenceSession(
+        encoder_outpath, providers=['CPUExecutionProvider'])
     input_names = [node.name for node in onnx_encoder.graph.input]
     for i in range(10):
         print("\t\tonnx  chunk-{}: {}, offset: {}, att_cache: {},"
-              " cnn_cache: {}, att_mask: {}".format(
-                  i, onnx_chunk.shape, onnx_offset, onnx_att_cache.shape,
-                  onnx_cnn_cache.shape, onnx_att_mask.shape))
+              " cnn_cache: {}, att_mask: {}".format(i, onnx_chunk.shape,
+                                                    onnx_offset,
+                                                    onnx_att_cache.shape,
+                                                    onnx_cnn_cache.shape,
+                                                    onnx_att_mask.shape))
         # NOTE(xsong): att_mask of the first few batches need changes if
         #   we use 16/4 mode.
         if args['left_chunks'] > 0:  # 16/4
             onnx_att_mask[:, :, -(args['chunk_size'] * (i + 1)):] = 1
         ort_inputs = {
-            'chunk': onnx_chunk, 'offset': onnx_offset,
+            'chunk': onnx_chunk,
+            'offset': onnx_offset,
             'required_cache_size': onnx_required_cache_size,
-            'att_cache': onnx_att_cache, 'cnn_cache': onnx_cnn_cache,
+            'att_cache': onnx_att_cache,
+            'cnn_cache': onnx_cnn_cache,
             'att_mask': onnx_att_mask
         }
         # NOTE(xcsong): If we use 16/-1, -1/-1 or 16/0 mode, `next_cache_start`
@@ -228,8 +262,10 @@ def export_encoder(asr_model, args):
         onnx_offset += ort_outs[0].shape[1]
     onnx_output = np.concatenate(onnx_output, axis=1)
 
-    np.testing.assert_allclose(to_numpy(torch_output), onnx_output,
-                               rtol=1e-03, atol=1e-05)
+    np.testing.assert_allclose(to_numpy(torch_output),
+                               onnx_output,
+                               rtol=1e-03,
+                               atol=1e-05)
     meta = ort_session.get_modelmeta()
     print("\t\tcustom_metadata_map={}".format(meta.custom_metadata_map))
     print("\t\tCheck onnx_encoder, pass!")
@@ -248,11 +284,16 @@ def export_ctc(asr_model, args):
 
     print("\tStage-2.2: torch.onnx.export")
     dynamic_axes = {'hidden': {1: 'T'}, 'probs': {1: 'T'}}
-    torch.onnx.export(
-        ctc, hidden, ctc_outpath, opset_version=13,
-        export_params=True, do_constant_folding=True,
-        input_names=['hidden'], output_names=['probs'],
-        dynamic_axes=dynamic_axes, verbose=False)
+    torch.onnx.export(ctc,
+                      hidden,
+                      ctc_outpath,
+                      opset_version=13,
+                      export_params=True,
+                      do_constant_folding=True,
+                      input_names=['hidden'],
+                      output_names=['probs'],
+                      dynamic_axes=dynamic_axes,
+                      verbose=False)
     onnx_ctc = onnx.load(ctc_outpath)
     for (k, v) in args.items():
         meta = onnx_ctc.metadata_props.add()
@@ -261,15 +302,22 @@ def export_ctc(asr_model, args):
     onnx.helper.printable_graph(onnx_ctc.graph)
     onnx.save(onnx_ctc, ctc_outpath)
     print_input_output_info(onnx_ctc, "onnx_ctc")
+    # Dynamic quantization
+    model_fp32 = ctc_outpath
+    model_quant = os.path.join(args['output_dir'], 'ctc.quant.onnx')
+    quantize_dynamic(model_fp32, model_quant, weight_type=QuantType.QUInt8)
     print('\t\tExport onnx_ctc, done! see {}'.format(ctc_outpath))
 
     print("\tStage-2.3: check onnx_ctc and torch_ctc")
     torch_output = ctc(hidden)
-    ort_session = onnxruntime.InferenceSession(ctc_outpath)
+    ort_session = onnxruntime.InferenceSession(
+        ctc_outpath, providers=['CPUExecutionProvider'])
     onnx_output = ort_session.run(None, {'hidden': to_numpy(hidden)})
 
-    np.testing.assert_allclose(to_numpy(torch_output), onnx_output[0],
-                               rtol=1e-03, atol=1e-05)
+    np.testing.assert_allclose(to_numpy(torch_output),
+                               onnx_output[0],
+                               rtol=1e-03,
+                               atol=1e-05)
     print("\t\tCheck onnx_ctc, pass!")
 
 
@@ -284,24 +332,43 @@ def export_decoder(asr_model, args):
     print("\tStage-3.1: prepare inputs for decoder")
     # hardcode time->200 nbest->10 len->20, they are dynamic axes.
     encoder_out = torch.randn((1, 200, args['output_size']))
-    hyps = torch.randint(low=0, high=args['vocab_size'],
-                         size=[10, 20])
+    hyps = torch.randint(low=0, high=args['vocab_size'], size=[10, 20])
     hyps[:, 0] = args['vocab_size'] - 1  # <sos>
     hyps_lens = torch.randint(low=15, high=21, size=[10])
 
     print("\tStage-3.2: torch.onnx.export")
     dynamic_axes = {
-        'hyps': {0: 'NBEST', 1: 'L'}, 'hyps_lens': {0: 'NBEST'},
-        'encoder_out': {1: 'T'},
-        'score': {0: 'NBEST', 1: 'L'}, 'r_score': {0: 'NBEST', 1: 'L'}
+        'hyps': {
+            0: 'NBEST',
+            1: 'L'
+        },
+        'hyps_lens': {
+            0: 'NBEST'
+        },
+        'encoder_out': {
+            1: 'T'
+        },
+        'score': {
+            0: 'NBEST',
+            1: 'L'
+        },
+        'r_score': {
+            0: 'NBEST',
+            1: 'L'
+        }
     }
     inputs = (hyps, hyps_lens, encoder_out, args['reverse_weight'])
     torch.onnx.export(
-        decoder, inputs, decoder_outpath, opset_version=13,
-        export_params=True, do_constant_folding=True,
+        decoder,
+        inputs,
+        decoder_outpath,
+        opset_version=13,
+        export_params=True,
+        do_constant_folding=True,
         input_names=['hyps', 'hyps_lens', 'encoder_out', 'reverse_weight'],
         output_names=['score', 'r_score'],
-        dynamic_axes=dynamic_axes, verbose=False)
+        dynamic_axes=dynamic_axes,
+        verbose=False)
     onnx_decoder = onnx.load(decoder_outpath)
     for (k, v) in args.items():
         meta = onnx_decoder.metadata_props.add()
@@ -310,13 +377,16 @@ def export_decoder(asr_model, args):
     onnx.helper.printable_graph(onnx_decoder.graph)
     onnx.save(onnx_decoder, decoder_outpath)
     print_input_output_info(onnx_decoder, "onnx_decoder")
-    print('\t\tExport onnx_decoder, done! see {}'.format(
-        decoder_outpath))
+    model_fp32 = decoder_outpath
+    model_quant = os.path.join(args['output_dir'], 'decoder.quant.onnx')
+    quantize_dynamic(model_fp32, model_quant, weight_type=QuantType.QUInt8)
+    print('\t\tExport onnx_decoder, done! see {}'.format(decoder_outpath))
 
     print("\tStage-3.3: check onnx_decoder and torch_decoder")
-    torch_score, torch_r_score = decoder(
-        hyps, hyps_lens, encoder_out, args['reverse_weight'])
-    ort_session = onnxruntime.InferenceSession(decoder_outpath)
+    torch_score, torch_r_score = decoder(hyps, hyps_lens, encoder_out,
+                                         args['reverse_weight'])
+    ort_session = onnxruntime.InferenceSession(
+        decoder_outpath, providers=['CPUExecutionProvider'])
     input_names = [node.name for node in onnx_decoder.graph.input]
     ort_inputs = {
         'hyps': to_numpy(hyps),
@@ -329,17 +399,23 @@ def export_decoder(asr_model, args):
             ort_inputs.pop(k)
     onnx_output = ort_session.run(None, ort_inputs)
 
-    np.testing.assert_allclose(to_numpy(torch_score), onnx_output[0],
-                               rtol=1e-03, atol=1e-05)
+    np.testing.assert_allclose(to_numpy(torch_score),
+                               onnx_output[0],
+                               rtol=1e-03,
+                               atol=1e-05)
     if args['is_bidirectional_decoder'] and args['reverse_weight'] > 0.0:
-        np.testing.assert_allclose(to_numpy(torch_r_score), onnx_output[1],
-                                   rtol=1e-03, atol=1e-05)
+        np.testing.assert_allclose(to_numpy(torch_r_score),
+                                   onnx_output[1],
+                                   rtol=1e-03,
+                                   atol=1e-05)
     print("\t\tCheck onnx_decoder, pass!")
 
 
 def main():
     torch.manual_seed(777)
     args = get_args()
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s')
     output_dir = args.output_dir
     os.system("mkdir -p " + output_dir)
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
@@ -347,8 +423,7 @@ def main():
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
-    model = init_asr_model(configs)
-    load_checkpoint(model, args.checkpoint)
+    model, configs = init_model(args, configs)
     model.eval()
     print(model)
 
@@ -360,7 +435,8 @@ def main():
     arguments['reverse_weight'] = args.reverse_weight
     arguments['output_size'] = configs['encoder_conf']['output_size']
     arguments['num_blocks'] = configs['encoder_conf']['num_blocks']
-    arguments['cnn_module_kernel'] = configs['encoder_conf']['cnn_module_kernel']
+    arguments['cnn_module_kernel'] = configs['encoder_conf'].get(
+        'cnn_module_kernel', 1)
     arguments['head'] = configs['encoder_conf']['attention_heads']
     arguments['feature_size'] = configs['input_dim']
     arguments['vocab_size'] = configs['output_dim']

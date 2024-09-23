@@ -1,5 +1,4 @@
-// Copyright 2022 Horizon Robotics. All Rights Reserved.
-// Author: binbin.zhang@horizon.ai (Binbin Zhang)
+// Copyright 2022 Binbin Zhang (binbzha@qq.com)
 
 #include "decoder/asr_model.h"
 
@@ -9,18 +8,18 @@
 namespace wenet {
 
 int AsrModel::num_frames_for_chunk(bool start) const {
-  int num_requried_frames = 0;
+  int num_required_frames = 0;
   if (chunk_size_ > 0) {
     if (!start) {                        // First batch
       int context = right_context_ + 1;  // Add current frame
-      num_requried_frames = (chunk_size_ - 1) * subsampling_rate_ + context;
+      num_required_frames = (chunk_size_ - 1) * subsampling_rate_ + context;
     } else {
-      num_requried_frames = chunk_size_ * subsampling_rate_;
+      num_required_frames = chunk_size_ * subsampling_rate_;
     }
   } else {
-    num_requried_frames = std::numeric_limits<int>::max();
+    num_required_frames = std::numeric_limits<int>::max();
   }
-  return num_requried_frames;
+  return num_required_frames;
 }
 
 void AsrModel::CacheFeature(
@@ -45,7 +44,7 @@ void AsrModel::ForwardEncoder(
     std::vector<std::vector<float>>* ctc_prob) {
   ctc_prob->clear();
   int num_frames = cached_feature_.size() + chunk_feats.size();
-  if (num_frames > right_context_ + 1) {
+  if (num_frames >= right_context_ + 1) {
     this->ForwardEncoderFunc(chunk_feats, ctc_prob);
     this->CacheFeature(chunk_feats);
   }

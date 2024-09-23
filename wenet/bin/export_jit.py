@@ -15,13 +15,13 @@
 from __future__ import print_function
 
 import argparse
+import logging
 import os
 
 import torch
 import yaml
 
-from wenet.transformer.asr_model import init_asr_model
-from wenet.utils.checkpoint import load_checkpoint
+from wenet.utils.init_model import init_model
 
 
 def get_args():
@@ -38,15 +38,17 @@ def get_args():
 
 def main():
     args = get_args()
+    args.jit = True
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s')
     # No need gpu for model export
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
-    model = init_asr_model(configs)
+    model, configs = init_model(args, configs)
+    model.eval()
     print(model)
-
-    load_checkpoint(model, args.checkpoint)
     # Export jit torch script model
 
     if args.output_file:
@@ -57,8 +59,7 @@ def main():
     # Export quantized jit torch script model
     if args.output_quant_file:
         quantized_model = torch.quantization.quantize_dynamic(
-            model, {torch.nn.Linear}, dtype=torch.qint8
-        )
+            model, {torch.nn.Linear}, dtype=torch.qint8)
         print(quantized_model)
         script_quant_model = torch.jit.script(quantized_model)
         script_quant_model.save(args.output_quant_file)

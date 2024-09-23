@@ -1,34 +1,53 @@
-# Copyright 2019 Mobvoi Inc. All Rights Reserved.
-# Author: binbinzhang@mobvoi.com (Binbin Zhang)
+# Copyright (c) 2020 Mobvoi Inc (Binbin Zhang)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import copy
+import datetime
 import logging
+import sys
 from contextlib import nullcontext
+
 # if your python version < 3.7 use the below one
 # from contextlib import suppress as nullcontext
 import torch
-from torch.nn.utils import clip_grad_norm_
+from wenet.utils.common import StepTimer
+
+from wenet.utils.train_utils import (wenet_join, batch_forward, batch_backward,
+                                     update_parameter_and_lr, log_per_step,
+                                     save_model)
 
 
 class Executor:
-    def __init__(self):
-        self.step = 0
 
-    def train(self, model, optimizer, scheduler, data_loader, device, writer,
-              args, scaler):
+    def __init__(self,
+                 global_step: int = 0,
+                 device: torch.device = torch.device("cpu")):
+        self.step = global_step + 1
+        self.train_step_timer = None
+        self.cv_step_timer = None
+        self.device = device
+
+    def train(self, model, optimizer, scheduler, train_data_loader,
+              cv_data_loader, writer, configs, scaler, group_join):
         ''' Train one epoch
         '''
+        if self.train_step_timer is None:
+            self.train_step_timer = StepTimer(self.step)
         model.train()
-        clip = args.get('grad_clip', 50.0)
-        log_interval = args.get('log_interval', 10)
-        rank = args.get('rank', 0)
-        epoch = args.get('epoch', 0)
-        accum_grad = args.get('accum_grad', 1)
-        is_distributed = args.get('is_distributed', True)
-        use_amp = args.get('use_amp', False)
+        info_dict = copy.deepcopy(configs)
         logging.info('using accumulate grad, new batch size is {} times'
-                     ' larger than before'.format(accum_grad))
-        if use_amp:
-            assert scaler is not None
+                     ' larger than before'.format(info_dict['accum_grad']))
         # A context manager to be used in conjunction with an instance of
         # torch.nn.parallel.DistributedDataParallel to be able to train
         # with uneven inputs across participating processes.
@@ -36,110 +55,107 @@ class Executor:
             model_context = model.join
         else:
             model_context = nullcontext
-        num_seen_utts = 0
+
         with model_context():
-            for batch_idx, batch in enumerate(data_loader):
-                key, feats, target, feats_lengths, target_lengths = batch
-                feats = feats.to(device)
-                target = target.to(device)
-                feats_lengths = feats_lengths.to(device)
-                target_lengths = target_lengths.to(device)
-                num_utts = target_lengths.size(0)
-                if num_utts == 0:
+            for batch_idx, batch_dict in enumerate(train_data_loader):
+                info_dict["tag"] = "TRAIN"
+                info_dict["step"] = self.step
+                info_dict["batch_idx"] = batch_idx
+                if wenet_join(group_join, info_dict):
+                    break
+
+                if batch_dict["target_lengths"].size(0) == 0:
                     continue
+
                 context = None
                 # Disable gradient synchronizations across DDP processes.
                 # Within this context, gradients will be accumulated on module
                 # variables, which will later be synchronized.
-                if is_distributed and batch_idx % accum_grad != 0:
+                if info_dict.get("train_engine", "torch_ddp") in [
+                        "torch_ddp", "torch_fsdp"
+                ] and (batch_idx + 1) % info_dict["accum_grad"] != 0:
                     context = model.no_sync
                 # Used for single gpu training and DDP gradient synchronization
                 # processes.
                 else:
                     context = nullcontext
+
                 with context():
-                    # autocast context
-                    # The more details about amp can be found in
-                    # https://pytorch.org/docs/stable/notes/amp_examples.html
-                    with torch.cuda.amp.autocast(scaler is not None):
-                        loss, loss_att, loss_ctc = model(
-                            feats, feats_lengths, target, target_lengths)
-                        loss = loss / accum_grad
-                    if use_amp:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    info_dict = batch_forward(model, batch_dict, scaler,
+                                              info_dict, self.device)
+                    info_dict = batch_backward(model, scaler, info_dict)
 
-                num_seen_utts += num_utts
-                if batch_idx % accum_grad == 0:
-                    if rank == 0 and writer is not None:
-                        writer.add_scalar('train_loss', loss, self.step)
-                    # Use mixed precision training
-                    if use_amp:
-                        scaler.unscale_(optimizer)
-                        grad_norm = clip_grad_norm_(model.parameters(), clip)
-                        # Must invoke scaler.update() if unscale_() is used in
-                        # the iteration to avoid the following error:
-                        #   RuntimeError: unscale_() has already been called
-                        #   on this optimizer since the last update().
-                        # We don't check grad here since that if the gradient
-                        # has inf/nan values, scaler.step will skip
-                        # optimizer.step().
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        grad_norm = clip_grad_norm_(model.parameters(), clip)
-                        if torch.isfinite(grad_norm):
-                            optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
-                    self.step += 1
-                if batch_idx % log_interval == 0:
-                    lr = optimizer.param_groups[0]['lr']
-                    log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
-                        epoch, batch_idx,
-                        loss.item() * accum_grad)
-                    if loss_att is not None:
-                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
-                    if loss_ctc is not None:
-                        log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
-                    log_str += 'lr {:.8f} rank {}'.format(lr, rank)
-                    logging.debug(log_str)
+                info_dict = update_parameter_and_lr(model, optimizer,
+                                                    scheduler, scaler,
+                                                    info_dict)
+                # write training: tensorboard && log
+                log_per_step(writer, info_dict, timer=self.train_step_timer)
+                save_interval = info_dict.get('save_interval', sys.maxsize)
+                if (self.step +
+                        1) % save_interval == 0 and self.step != 0 and (
+                            batch_idx + 1) % info_dict["accum_grad"] == 0:
+                    import torch.distributed as dist
+                    # Ensure all ranks start CV at the same time in step mode
+                    dist.barrier()
+                    loss_dict = self.cv(model, cv_data_loader, configs)
+                    model.train()
+                    info_dict.update({
+                        "tag":
+                        "step_{}".format(self.step),
+                        "loss_dict":
+                        loss_dict,
+                        "save_time":
+                        datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+                        "lrs":
+                        [group['lr'] for group in optimizer.param_groups]
+                    })
+                    save_model(model, info_dict)
+                    # write final cv: tensorboard
+                    log_per_step(writer, info_dict)
+                    # Ensure all ranks start Train at the same time in step mode
+                    dist.barrier()
+                self.step += 1 if (batch_idx +
+                                   1) % info_dict["accum_grad"] == 0 else 0
 
-    def cv(self, model, data_loader, device, args):
+    def cv(self, model, cv_data_loader, configs):
         ''' Cross validation on
         '''
+        if self.cv_step_timer is None:
+            self.cv_step_timer = StepTimer(0.0)
+        else:
+            self.cv_step_timer.last_iteration = 0.0
         model.eval()
-        rank = args.get('rank', 0)
-        epoch = args.get('epoch', 0)
-        log_interval = args.get('log_interval', 10)
-        # in order to avoid division by 0
-        num_seen_utts = 1
-        total_loss = 0.0
+        info_dict = copy.deepcopy(configs)
+        num_seen_utts, loss_dict, total_acc = 1, {}, []  # avoid division by 0
         with torch.no_grad():
-            for batch_idx, batch in enumerate(data_loader):
-                key, feats, target, feats_lengths, target_lengths = batch
-                feats = feats.to(device)
-                target = target.to(device)
-                feats_lengths = feats_lengths.to(device)
-                target_lengths = target_lengths.to(device)
-                num_utts = target_lengths.size(0)
+            for batch_idx, batch_dict in enumerate(cv_data_loader):
+                info_dict["tag"] = "CV"
+                info_dict["step"] = self.step
+                info_dict["batch_idx"] = batch_idx
+                info_dict["cv_step"] = batch_idx
+
+                num_utts = batch_dict["target_lengths"].size(0)
                 if num_utts == 0:
                     continue
-                loss, loss_att, loss_ctc = model(feats, feats_lengths, target,
-                                                 target_lengths)
-                if torch.isfinite(loss):
-                    num_seen_utts += num_utts
-                    total_loss += loss.item() * num_utts
-                if batch_idx % log_interval == 0:
-                    log_str = 'CV Batch {}/{} loss {:.6f} '.format(
-                        epoch, batch_idx, loss.item())
-                    if loss_att is not None:
-                        log_str += 'loss_att {:.6f} '.format(loss_att.item())
-                    if loss_ctc is not None:
-                        log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
-                    log_str += 'history loss {:.6f}'.format(total_loss /
-                                                            num_seen_utts)
-                    log_str += ' rank {}'.format(rank)
-                    logging.debug(log_str)
-        return total_loss, num_seen_utts
+
+                info_dict = batch_forward(model, batch_dict, None, info_dict,
+                                          self.device)
+                _dict = info_dict["loss_dict"]
+
+                num_seen_utts += num_utts
+                total_acc.append(_dict['th_accuracy'].item(
+                ) if _dict.get('th_accuracy', None) is not None else 0.0)
+                for loss_name, loss_value in _dict.items():
+                    if loss_value is not None and "loss" in loss_name \
+                            and torch.isfinite(loss_value):
+                        loss_value = loss_value.item()
+                        loss_dict[loss_name] = loss_dict.get(loss_name, 0) + \
+                            loss_value * num_utts
+                # write cv: log
+                log_per_step(writer=None,
+                             info_dict=info_dict,
+                             timer=self.cv_step_timer)
+        for loss_name, loss_value in loss_dict.items():
+            loss_dict[loss_name] = loss_dict[loss_name] / num_seen_utts
+        loss_dict["acc"] = sum(total_acc) / len(total_acc)
+        return loss_dict

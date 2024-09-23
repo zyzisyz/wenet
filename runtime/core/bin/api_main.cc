@@ -1,4 +1,4 @@
-// Copyright (c) 2022  Binbin Zhang(binbzha@qq.com)
+// Copyright (c) 2022  Binbin Zhang (binbzha@qq.com)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,9 +36,9 @@ int main(int argc, char* argv[]) {
 
   for (int i = 0; i < 10; i++) {
     // Return the final result when last is 1
-    wenet_decode(decoder, reinterpret_cast<const char*>(data.data()),
-                 data.size() * 2, 1);
-    const char* result = wenet_get_result(decoder);
+    const char* result =
+        wenet_decode(decoder, reinterpret_cast<const char*>(data.data()),
+                     data.size() * 2, 1);
     LOG(INFO) << i << " " << result;
     wenet_reset(decoder);
   }

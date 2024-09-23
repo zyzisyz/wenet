@@ -59,7 +59,7 @@ if [ $end -ge 3 ] && [ $beg -le 3 ]; then
    --train_config $train_config \
     --in_scp $data_dir/train/wav.scp \
     --out_cmvn $data_dir/train/global_cmvn
-  echo "Prepare data, prepare requried format"
+  echo "Prepare data, prepare required format"
   for x in train dev; do
   tools/make_raw_list.py $data_dir/$x/wav.scp $data_dir/$x/char \
     $data_dir/$x/data.list
@@ -69,7 +69,6 @@ fi
 if [ $end -ge 4 ] && [ $beg -le 4 ]; then
   mkdir -p $exp_dir && cp $data_dir/train/global_cmvn $exp_dir
   python wenet/bin/train.py \
-    --gpu 0 \
     --config $train_config \
     --train_data $data_dir/train/data.list \
     --cv_data $data_dir/dev/data.list \

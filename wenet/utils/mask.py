@@ -1,10 +1,19 @@
-# -*- coding: utf-8 -*-
-
-# Copyright 2019 Shigeki Karita
-#  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
+# Copyright (c) 2019 Shigeki Karita
+#               2020 Mobvoi Inc (Binbin Zhang)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
-
 '''
 def subsequent_mask(
         size: int,
@@ -38,6 +47,7 @@ def subsequent_mask(
     ret = torch.ones(size, size, device=device, dtype=torch.bool)
     return torch.tril(ret)
 '''
+
 
 def subsequent_mask(
         size: int,
@@ -113,11 +123,15 @@ def subsequent_chunk_mask(
     return ret
 
 
-def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
+def add_optional_chunk_mask(xs: torch.Tensor,
+                            masks: torch.Tensor,
                             use_dynamic_chunk: bool,
                             use_dynamic_left_chunk: bool,
-                            decoding_chunk_size: int, static_chunk_size: int,
-                            num_decoding_left_chunks: int):
+                            decoding_chunk_size: int,
+                            static_chunk_size: int,
+                            num_decoding_left_chunks: int,
+                            enable_full_context: bool = True,
+                            max_chunk_size: int = 25):
     """ Apply optional mask for encoder.
 
     Args:
@@ -137,6 +151,9 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
             the chunk size is decoding_chunk_size.
             >=0: use num_decoding_left_chunks
             <0: use all left chunks
+        enable_full_context (bool):
+            True: chunk size is either [1, max_chunk_size] or full context(max_len)
+            False: chunk size ~ U[1, max_chunk_size]
 
     Returns:
         torch.Tensor: chunk mask of the input xs.
@@ -151,15 +168,15 @@ def add_optional_chunk_mask(xs: torch.Tensor, masks: torch.Tensor,
             chunk_size = decoding_chunk_size
             num_left_chunks = num_decoding_left_chunks
         else:
-            # chunk size is either [1, 25] or full context(max_len).
+            # chunk size is either [1, max_chunk_size] or full context(max_len).
             # Since we use 4 times subsampling and allow up to 1s(100 frames)
             # delay, the maximum frame is 100 / 4 = 25.
             chunk_size = torch.randint(1, max_len, (1, )).item()
             num_left_chunks = -1
-            if chunk_size > max_len // 2:
+            if chunk_size > max_len // 2 and enable_full_context:
                 chunk_size = max_len
             else:
-                chunk_size = chunk_size % 25 + 1
+                chunk_size = chunk_size % max_chunk_size + 1
                 if use_dynamic_left_chunk:
                     max_left_chunks = (max_len - 1) // chunk_size
                     num_left_chunks = torch.randint(0, max_left_chunks,
@@ -285,3 +302,72 @@ def mask_finished_preds(pred: torch.Tensor, flag: torch.Tensor,
     beam_size = pred.size(-1)
     finished = flag.repeat([1, beam_size])
     return pred.masked_fill_(finished, eos)
+
+
+def causal_or_lookahead_mask(
+    mask: torch.Tensor,
+    right_context: int,
+    left_context: int,
+    left_t_valid: int = 0,
+) -> torch.Tensor:
+    """Create mask (B, T, T) with history or future or both,
+       this is for causal or noncausal streaming encoder
+
+    Args:
+        mask (torch.Tensor): size of mask shape (B, 1, T)
+        right_context (int): future context size
+        left_context (int): history context size
+        left_t_valid (int): valid start offset
+
+    Returns:
+        torch.Tensor: mask shape (B, T, T)
+
+    Examples:
+        >>> seq_len  = torch.tensor([2,3,4])
+        >>> seq_mask = make_non_pad_mask(seq_len)
+        [[1, 1, 0, 0],
+        [1, 1, 1, 0],
+        [1, 1, 1, 1]]
+        >>> causal_or_lookahead_mask(seq_mask.unsqueeze(1), 0, 2)
+        [[[1, 0, 0, 0],
+         [1, 1, 0, 0],
+         [0, 0, 0, 0],
+         [0, 0, 0, 0]],
+
+        [[1, 0, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 0],
+         [0, 0, 0, 0]],
+
+        [[1, 0, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 0],
+         [0, 1, 1, 1]]]
+        >>> causal_or_lookahead_mask(seq_mask.unsqueeze(1), 1, 2)
+        [[[1, 1, 0, 0],
+         [1, 1, 0, 0],
+         [0, 0, 0, 0],
+         [0, 0, 0, 0]],
+
+        [[1, 1, 0, 0],
+         [1, 1, 1, 0],
+         [1, 1, 1, 0],
+         [0, 0, 0, 0]],
+
+        [[1, 1, 0, 0],
+         [1, 1, 1, 0],
+         [1, 1, 1, 1],
+         [0, 1, 1, 1]]]
+    """
+    _, _, T = mask.size()
+    indices = torch.arange(T, device=mask.device)
+    start = torch.where(indices > left_context, indices - left_context, 0)
+    start = torch.where(indices < left_t_valid, indices, start).unsqueeze(1)
+
+    end = indices + right_context + 1
+    end = end.unsqueeze(1)
+    indices_expand = indices.unsqueeze(0)
+    gt = (indices_expand >= start)
+    lt = (indices_expand < end)
+
+    return (gt & lt) * mask.transpose(1, 2) * mask

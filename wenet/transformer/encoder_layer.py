@@ -1,14 +1,28 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Copyright 2019 Mobvoi Inc. All Rights Reserved.
-# Author: di.wu@mobvoi.com (DI WU)
+# Copyright (c) 2021 Mobvoi Inc (Binbin Zhang, Di Wu)
+#               2022 Xingchen Song (sxc19@mails.tsinghua.edu.cn)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder self-attention layer definition."""
 
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
+from wenet.transformer.attention import T_CACHE
+
+from wenet.utils.class_utils import WENET_NORM_CLASSES
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -25,12 +39,8 @@ class TransformerEncoderLayer(nn.Module):
         normalize_before (bool):
             True: use layer_norm before each sub-block.
             False: to use layer_norm after each sub-block.
-        concat_after (bool): Whether to concat attention layer's input and
-            output.
-            True: x -> x + linear(concat(x, att(x)))
-            False: x -> x + att(x)
-
     """
+
     def __init__(
         self,
         size: int,
@@ -38,22 +48,27 @@ class TransformerEncoderLayer(nn.Module):
         feed_forward: torch.nn.Module,
         dropout_rate: float,
         normalize_before: bool = True,
-        concat_after: bool = False,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        rms_norm_offset: bool = True,
     ):
         """Construct an EncoderLayer object."""
         super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.norm1 = nn.LayerNorm(size, eps=1e-5)
-        self.norm2 = nn.LayerNorm(size, eps=1e-5)
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
+
+        norm_class = WENET_NORM_CLASSES[layer_norm_type]
+        if layer_norm_type == "rms_norm":
+            norm_class = partial(
+                norm_class,
+                add_unit_offset=rms_norm_offset,
+            )
+        self.norm1 = norm_class(size, eps=norm_eps)
+        self.norm2 = norm_class(size, eps=norm_eps)
         self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
-        self.concat_after = concat_after
-        if concat_after:
-            self.concat_linear = nn.Linear(size + size, size)
-        else:
-            self.concat_linear = nn.Identity()
 
     def forward(
         self,
@@ -61,9 +76,10 @@ class TransformerEncoderLayer(nn.Module):
         mask: torch.Tensor,
         pos_emb: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
+        att_cache: T_CACHE = (torch.zeros(
+            (0, 0, 0, 0)), torch.zeros((0, 0, 0, 0))),
         cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
         """Compute encoded features.
 
         Args:
@@ -90,14 +106,13 @@ class TransformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm1(x)
-
-        x_att, new_att_cache = self.self_attn(
-            x, x, x, mask, cache=att_cache)
-        if self.concat_after:
-            x_concat = torch.cat((x, x_att), dim=-1)
-            x = residual + self.concat_linear(x_concat)
-        else:
-            x = residual + self.dropout(x_att)
+        x_att, new_att_cache = self.self_attn(x,
+                                              x,
+                                              x,
+                                              mask,
+                                              pos_emb,
+                                              cache=att_cache)
+        x = residual + self.dropout(x_att)
         if not self.normalize_before:
             x = self.norm1(x)
 
@@ -130,11 +145,8 @@ class ConformerEncoderLayer(nn.Module):
         normalize_before (bool):
             True: use layer_norm before each sub-block.
             False: use layer_norm after each sub-block.
-        concat_after (bool): Whether to concat attention layer's input and
-            output.
-            True: x -> x + linear(concat(x, att(x)))
-            False: x -> x + att(x)
     """
+
     def __init__(
         self,
         size: int,
@@ -144,35 +156,34 @@ class ConformerEncoderLayer(nn.Module):
         conv_module: Optional[nn.Module] = None,
         dropout_rate: float = 0.1,
         normalize_before: bool = True,
-        concat_after: bool = False,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
     ):
         """Construct an EncoderLayer object."""
         super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
         self.feed_forward_macaron = feed_forward_macaron
         self.conv_module = conv_module
-        self.norm_ff = nn.LayerNorm(size, eps=1e-5)  # for the FNN module
-        self.norm_mha = nn.LayerNorm(size, eps=1e-5)  # for the MHA module
+        self.norm_ff = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the FNN module
+        self.norm_mha = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the MHA module
         if feed_forward_macaron is not None:
-            self.norm_ff_macaron = nn.LayerNorm(size, eps=1e-5)
+            self.norm_ff_macaron = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)
             self.ff_scale = 0.5
         else:
             self.ff_scale = 1.0
         if self.conv_module is not None:
-            self.norm_conv = nn.LayerNorm(size,
-                                          eps=1e-5)  # for the CNN module
-            self.norm_final = nn.LayerNorm(
-                size, eps=1e-5)  # for the final output of the block
+            self.norm_conv = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the CNN module
+            self.norm_final = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the final output of the block
         self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
-        self.concat_after = concat_after
-        if self.concat_after:
-            self.concat_linear = nn.Linear(size + size, size)
-        else:
-            self.concat_linear = nn.Identity()
-
 
     def forward(
         self,
@@ -180,9 +191,10 @@ class ConformerEncoderLayer(nn.Module):
         mask: torch.Tensor,
         pos_emb: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
-        att_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
+        att_cache: T_CACHE = (torch.zeros(
+            (0, 0, 0, 0)), torch.zeros((0, 0, 0, 0))),
         cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
         """Compute encoded features.
 
         Args:
@@ -219,14 +231,9 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
-
-        x_att, new_att_cache = self.self_attn(
-            x, x, x, mask, pos_emb, att_cache)
-        if self.concat_after:
-            x_concat = torch.cat((x, x_att), dim=-1)
-            x = residual + self.concat_linear(x_concat)
-        else:
-            x = residual + self.dropout(x_att)
+        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb,
+                                              att_cache)
+        x = residual + self.dropout(x_att)
         if not self.normalize_before:
             x = self.norm_mha(x)
 

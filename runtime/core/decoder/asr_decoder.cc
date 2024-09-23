@@ -1,6 +1,17 @@
-// Copyright 2020 Mobvoi Inc. All Rights Reserved.
-// Author: binbinzhang@mobvoi.com (Binbin Zhang)
-//         di.wu@mobvoi.com (Di Wu)
+// Copyright (c) 2020 Mobvoi Inc (Binbin Zhang, Di Wu)
+//               2022 Binbin Zhang (binbzha@qq.com)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "decoder/asr_decoder.h"
 
@@ -22,6 +33,7 @@ AsrDecoder::AsrDecoder(std::shared_ptr<FeaturePipeline> feature_pipeline,
       // status of the model
       model_(resource->model->Copy()),
       post_processor_(resource->post_processor),
+      context_graph_(resource->context_graph),
       symbol_table_(resource->symbol_table),
       fst_(resource->fst),
       unit_table_(resource->unit_table),
@@ -76,25 +88,31 @@ DecodeState AsrDecoder::AdvanceDecoding(bool block) {
   DecodeState state = DecodeState::kEndBatch;
   model_->set_chunk_size(opts_.chunk_size);
   model_->set_num_left_chunks(opts_.num_left_chunks);
-  int num_requried_frames = model_->num_frames_for_chunk(start_);
+  int num_required_frames = model_->num_frames_for_chunk(start_);
   std::vector<std::vector<float>> chunk_feats;
   // Return immediately if we do not want to block
   if (!block && !feature_pipeline_->input_finished() &&
-      feature_pipeline_->NumQueuedFrames() < num_requried_frames) {
+      feature_pipeline_->NumQueuedFrames() < num_required_frames) {
     return DecodeState::kWaitFeats;
   }
   // If not okay, that means we reach the end of the input
-  if (!feature_pipeline_->Read(num_requried_frames, &chunk_feats)) {
+  if (!feature_pipeline_->Read(num_required_frames, &chunk_feats)) {
     state = DecodeState::kEndFeats;
   }
 
   num_frames_ += chunk_feats.size();
-  VLOG(2) << "Required " << num_requried_frames << " get "
+  VLOG(2) << "Required " << num_required_frames << " get "
           << chunk_feats.size();
   Timer timer;
   std::vector<std::vector<float>> ctc_log_probs;
   model_->ForwardEncoder(chunk_feats, &ctc_log_probs);
   int forward_time = timer.Elapsed();
+  if (opts_.ctc_wfst_search_opts.blank_scale != 1.0) {
+    for (int i = 0; i < ctc_log_probs.size(); i++) {
+      ctc_log_probs[i][0] = ctc_log_probs[i][0] +
+                            std::log(opts_.ctc_wfst_search_opts.blank_scale);
+    }
+  }
   timer.Reset();
   searcher_->Search(ctc_log_probs);
   int search_time = timer.Elapsed();
@@ -180,6 +198,19 @@ void AsrDecoder::UpdateResult(bool finish) {
 
   if (DecodedSomething()) {
     VLOG(1) << "Partial CTC result " << result_[0].sentence;
+    if (context_graph_ != nullptr) {
+      int cur_state = 0;
+      float score = 0;
+      for (int ilabel : inputs[0]) {
+        cur_state = context_graph_->GetNextState(cur_state, ilabel, &score,
+                                                 &(result_[0].contexts));
+      }
+      std::string contexts;
+      for (const auto& context : result_[0].contexts) {
+        contexts += context + ", ";
+      }
+      VLOG(1) << "Contexts: " << contexts;
+    }
   }
 }
 
@@ -198,6 +229,7 @@ void AsrDecoder::AttentionRescoring() {
     return;
   }
 
+  // TODO(zhendong.peng): Do we need rescoring while context matching?
   std::vector<float> rescoring_score;
   model_->AttentionRescoring(hypotheses, opts_.reverse_weight,
                              &rescoring_score);
